@@ -4,10 +4,12 @@
 FlareSolverr-compatible /v1 API. Handles the following out of the box:
   - DDoS-Guard JS PoW challenges (passive wait)
   - Cloudflare interstitial / Turnstile (click-based)
+  - Cloudflare Turnstile standalone widget (click-based)
   - Plain pages (passthrough)
 
 With third-party services:
   - hCaptcha / reCAPTCHA / other visual captchas (requires 2Captcha API key)
+  - Residential proxy routing to reduce challenge severity (PROXY_URL env)
 """
 
 import json
@@ -16,6 +18,7 @@ import os
 import sys
 import time
 import threading
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, request, jsonify
@@ -30,23 +33,29 @@ log = logging.getLogger("gatecrasher")
 
 app = Flask(__name__)
 
-# 2Captcha config
+# ── 3rd-party service config ─────────────────────────────────────────────
 CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
 CAPTCHA_BASE_URL = os.environ.get("CAPTCHA_BASE_URL", "https://2captcha.com")
 CAPTCHA_POLL_INTERVAL = 5
 CAPTCHA_MAX_POLLS = 60
 
+PROXY_URL = os.environ.get("PROXY_URL", "")
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+
+# ── Challenge detection ──────────────────────────────────────────────────
 CHALLENGE_TITLES = ["DDoS-Guard", "Just a moment..."]
 
-# Turnstile constants
+# Turnstile constants (ported from Solverr/playwright-captcha)
 _TURNSTILE_CHECKBOX_X = 30
+_TURNSTILE_CHECKBOX_Y_RATIO = 0.5
 _TURNSTILE_POLL_INTERVAL = 0.5
 _TURNSTILE_DEADLINE_SECONDS = 30
 _WIDGET_MIN_WIDTH = 40
 _WIDGET_MIN_HEIGHT = 20
 _WIDGET_MAX_HEIGHT = 120
 
-# Browser singleton (thread-safe)
+# ── Browser singleton ────────────────────────────────────────────────────
 _browser_lock = threading.Lock()
 _browser = None
 _playwright = None
@@ -75,6 +84,35 @@ def get_browser():
                 ],
             )
         return _browser
+
+
+# ── Proxy helpers ────────────────────────────────────────────────────────
+
+
+def _proxy_config() -> dict | None:
+    """Build Playwright proxy config from environment variables."""
+    if not PROXY_URL:
+        return None
+    config = {"server": PROXY_URL}
+    if PROXY_USERNAME:
+        config["username"] = PROXY_USERNAME
+    if PROXY_PASSWORD:
+        config["password"] = PROXY_PASSWORD
+    return config
+
+
+def _proxy_string_2captcha() -> str | None:
+    """Proxy string in 2Captcha format (user:pass@host:port) or None."""
+    if not PROXY_URL:
+        return None
+    parsed = urlparse(PROXY_URL)
+    host = parsed.hostname
+    port = parsed.port or 3128
+    auth = f"{PROXY_USERNAME}:{PROXY_PASSWORD}@" if PROXY_USERNAME else ""
+    return f"{auth}{host}:{port}"
+
+
+# ── Challenge classification ─────────────────────────────────────────────
 
 
 def _classify_challenge(page) -> str:
@@ -123,16 +161,20 @@ def _classify_challenge(page) -> str:
 
 
 def _turnstile_widget_box(page):
-    """Measure the Turnstile widget's bounding box for clicking."""
+    """Measure the Turnstile widget's bounding box for clicking.
+
+    Tries the Turnstile iframe first, then falls back to the container
+    around the cf-turnstile-response input.
+    """
     try:
-        # First try: Turnstile iframe
+        # First try: find the Turnstile iframe
         iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
         if iframe:
             box = iframe.bounding_box()
             if box and box["width"] > _WIDGET_MIN_WIDTH:
                 return box
 
-        # Second try: wrapper via cf-turnstile-response input ancestors
+        # Second try: find the wrapper via the hidden input's ancestors
         input_el = page.query_selector('input[name="cf-turnstile-response"]')
         if input_el:
             for depth in (1, 2, 3, 4):
@@ -157,7 +199,7 @@ def _turnstile_widget_box(page):
                 except Exception:
                     continue
 
-        # Third try: common selectors
+        # Third try: #turnstile-wrapper or .cf-turnstile
         for sel in ("#turnstile-wrapper", ".cf-turnstile", "[data-cf-turnstile]"):
             el = page.query_selector(sel)
             if el:
@@ -188,13 +230,15 @@ def _turnstile_has_token(page) -> bool:
 def _solve_turnstile_click(page) -> bool:
     """Click the Turnstile checkbox and wait for verification.
 
-    Works out of the box — Turnstile's checkbox is a passive fingerprint
-    check, not a visual puzzle. Returns True if the challenge cleared.
+    This works out of the box — no third-party service needed — because
+    Turnstile's checkbox is a passive fingerprint check, not a visual puzzle.
+    Returns True if the challenge cleared.
     """
     log.info("Solving Turnstile via click...")
     deadline = time.monotonic() + _TURNSTILE_DEADLINE_SECONDS
 
     while time.monotonic() < deadline:
+        # If already verified, we're done
         if _turnstile_has_token(page):
             log.info("Turnstile already verified (token present)")
             return True
@@ -202,10 +246,11 @@ def _solve_turnstile_click(page) -> bool:
         box = _turnstile_widget_box(page)
         if box:
             click_x = box["x"] + _TURNSTILE_CHECKBOX_X
-            click_y = box["y"] + box["height"] * 0.5
+            click_y = box["y"] + box["height"] * _TURNSTILE_CHECKBOX_Y_RATIO
             page.mouse.click(click_x, click_y)
-            log.debug("Clicked Turnstile at (%.0f, %.0f)", click_x, click_y)
+            log.debug("Clicked Turnstile checkbox at (%.0f, %.0f)", click_x, click_y)
 
+        # Wait for verification
         for _ in range(int(_TURNSTILE_DEADLINE_SECONDS / _TURNSTILE_POLL_INTERVAL)):
             if time.monotonic() > deadline:
                 break
@@ -245,23 +290,26 @@ def _solve_hcaptcha(sitekey: str, page_url: str) -> str | None:
     if not CAPTCHA_API_KEY:
         return None
 
+    proxy_str = _proxy_string_2captcha()
+
     try:
-        resp = requests.post(
-            f"{CAPTCHA_BASE_URL}/in.php",
-            data={
-                "key": CAPTCHA_API_KEY,
-                "method": "hcaptcha",
-                "sitekey": sitekey,
-                "pageurl": page_url,
-                "json": 1,
-            },
-            timeout=30,
-        )
-        data = resp.json()
-        if data.get("status") != 1:
-            log.error("2Captcha submit failed: %s", data.get("request", "unknown"))
+        data = {
+            "key": CAPTCHA_API_KEY,
+            "method": "hcaptcha",
+            "sitekey": sitekey,
+            "pageurl": page_url,
+            "json": 1,
+        }
+        if proxy_str:
+            data["proxy"] = proxy_str
+            data["proxytype"] = "http"
+
+        resp = requests.post(f"{CAPTCHA_BASE_URL}/in.php", data=data, timeout=30)
+        result = resp.json()
+        if result.get("status") != 1:
+            log.error("2Captcha submit failed: %s", result.get("request", "unknown"))
             return None
-        captcha_id = data["request"]
+        captcha_id = result["request"]
         log.info("2Captcha job submitted (id=%s)", captcha_id)
     except Exception as e:
         log.error("2Captcha submit error: %s", e)
@@ -337,34 +385,13 @@ def _inject_hcaptcha_token(page, token: str) -> bool:
         return False
 
 
-def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
-    """Navigate to a URL, clear any challenge, return the page content.
+# ── Stealth patches ──────────────────────────────────────────────────────
 
-    Returns a FlareSolverr-compatible response dict.
-    """
-    browser = get_browser()
-    timeout_s = max_timeout_ms / 1000.0
-    deadline = time.monotonic() + timeout_s
 
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
-        ),
-        locale="en-US",
-        timezone_id="Europe/London",
-        viewport={"width": 1920, "height": 1080},
-    )
-    page = None
-    challenge_was_present = False
-    solved = False
-
-    try:
-        page = context.new_page()
-
-        # Apply stealth patches before any navigation
-        page.add_init_script(
-            """() => {
+def _apply_stealth(page):
+    """Apply browser fingerprint patches before navigation."""
+    page.add_init_script(
+        """() => {
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined, configurable: true,
             });
@@ -402,7 +429,38 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
                         : q(p);
             }
         }"""
-        )
+    )
+
+
+# ── Core solver ──────────────────────────────────────────────────────────
+
+
+def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
+    """Navigate to a URL, clear any challenge, return the page content.
+
+    Returns a FlareSolverr-compatible response dict.
+    """
+    browser = get_browser()
+    timeout_s = max_timeout_ms / 1000.0
+    deadline = time.monotonic() + timeout_s
+
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+        ),
+        locale="en-US",
+        timezone_id="Europe/London",
+        viewport={"width": 1920, "height": 1080},
+        proxy=_proxy_config(),
+    )
+    page = None
+    challenge_was_present = False
+    solved = False
+
+    try:
+        page = context.new_page()
+        _apply_stealth(page)
 
         log.info("Navigating to %s", url)
         page.goto(url, wait_until="domcontentloaded", timeout=max_timeout_ms)
@@ -454,7 +512,7 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
                     log.warning("hCaptcha detected but CAPTCHA_API_KEY not set")
 
             elif challenge_type in ("jspow", "unknown"):
-                log.info("Waiting for JS PoW / interstitial to clear...")
+                log.info("Waiting for JS PoW / interstitial challenge to clear...")
                 while time.monotonic() < deadline:
                     try:
                         ct = page.title()
@@ -531,6 +589,9 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
             except Exception:
                 pass
         context.close()
+
+
+# ── HTTP routes ──────────────────────────────────────────────────────────
 
 
 @app.route("/v1", methods=["POST"])

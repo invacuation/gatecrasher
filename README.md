@@ -19,6 +19,7 @@
 | Service | What it enables | How to set |
 |---|---|---|
 | **[2Captcha](https://2captcha.com)** (or compatible) API key | Solves visual hCaptcha, reCAPTCHA v2/v3, and other image-based captchas | `CAPTCHA_API_KEY` env var |
+| **Residential proxy** | Routes browser traffic through a residential IP, reducing challenge severity from providers like DDoS-Guard | `PROXY_URL`, `PROXY_USERNAME`, `PROXY_PASSWORD` env vars |
 
 > **Why some captchas need a third party:** Visual puzzles (hCaptcha, reCAPTCHA) are designed to be unsolvable by automation — they require either human workers or ML-based solving services. Passive checks like Turnstile's fingerprint and Cloudflare's JS proof-of-work are solvable natively because they test browser environment signals, not visual recognition.
 
@@ -46,12 +47,17 @@ docker run -d \
 
 ## Configuration
 
+All configuration is via environment variables.
+
 ### Third-party integrations
 
 | Variable | Default | Description |
 |---|---|---|
 | `CAPTCHA_API_KEY` | — | 2Captcha API key for visual captcha solving |
 | `CAPTCHA_BASE_URL` | `https://2captcha.com` | 2Captcha-compatible API endpoint |
+| `PROXY_URL` | — | Proxy server URL (e.g. `http://res.proxy.example:10000`) |
+| `PROXY_USERNAME` | — | Proxy authentication username |
+| `PROXY_PASSWORD` | — | Proxy authentication password |
 
 ### Solver tuning
 
