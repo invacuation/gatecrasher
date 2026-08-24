@@ -11,6 +11,7 @@
 | **Cloudflare JS interstitial** ("Just a moment...") | Waits for the proof-of-work to complete and the page to redirect |
 | **Cloudflare Turnstile** (passive checkbox) | Clicks the checkbox at the correct coordinates and waits for verification |
 | **DDoS-Guard JS PoW** | Waits for the proof-of-work to complete |
+| **DDoS-Guard hCaptcha** | Extracts the sitekey and submits to 2Captcha for solving |
 | **No challenge** | Returns the page content directly |
 
 ### With third-party services
