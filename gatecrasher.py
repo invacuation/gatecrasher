@@ -512,12 +512,29 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
                     log.warning("hCaptcha detected but CAPTCHA_API_KEY not set")
 
             elif challenge_type in ("jspow", "unknown"):
-                log.info("Waiting for JS PoW / interstitial challenge to clear...")
+                log.info("Waiting for JS PoW / interstitial to clear...")
                 while time.monotonic() < deadline:
                     try:
                         ct = page.title()
                     except Exception:
                         log.info("Challenge cleared (navigation detected)")
+                        try:
+                            page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                        time.sleep(2)
+                        try:
+                            ct2 = page.title()
+                        except Exception:
+                            time.sleep(3)
+                            try:
+                                ct2 = page.title()
+                            except Exception:
+                                continue
+                        if any(t.lower() in ct2.lower() for t in CHALLENGE_TITLES):
+                            log.info("New page is also a challenge: %s, continuing wait", ct2)
+                            continue
+                        log.info("Challenge cleared! Title: %s", ct2)
                         solved = True
                         break
                     if not any(t.lower() in ct.lower() for t in CHALLENGE_TITLES):
