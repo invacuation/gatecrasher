@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.playwright/
+__pycache__

@@ -1,0 +1,5 @@
+playwright==1.52.0
+flask==3.1.1
+gunicorn==23.0.0
+gevent==24.11.1
+requests==2.32.3
