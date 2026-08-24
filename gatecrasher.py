@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Gatecrasher — DDoS-Guard bypass proxy with optional 2Captcha hCaptcha solving.
+"""Gatecrasher — anti-bot challenge bypass proxy.
 
-FlareSolverr-compatible /v1 API. Handles:
-  - DDoS-Guard hCaptcha interstitials (via 2Captcha)
+FlareSolverr-compatible /v1 API. Handles the following out of the box:
   - DDoS-Guard JS PoW challenges (passive wait)
-  - Cloudflare Turnstile / JS challenges (passive wait)
+  - Cloudflare interstitial / Turnstile (click-based)
   - Plain pages (passthrough)
 
-Set CAPTCHA_API_KEY to enable 2Captcha hCaptcha solving.
+With third-party services:
+  - hCaptcha / reCAPTCHA / other visual captchas (requires 2Captcha API key)
 """
 
 import json
@@ -37,6 +37,14 @@ CAPTCHA_POLL_INTERVAL = 5
 CAPTCHA_MAX_POLLS = 60
 
 CHALLENGE_TITLES = ["DDoS-Guard", "Just a moment..."]
+
+# Turnstile constants
+_TURNSTILE_CHECKBOX_X = 30
+_TURNSTILE_POLL_INTERVAL = 0.5
+_TURNSTILE_DEADLINE_SECONDS = 30
+_WIDGET_MIN_WIDTH = 40
+_WIDGET_MIN_HEIGHT = 20
+_WIDGET_MAX_HEIGHT = 120
 
 # Browser singleton (thread-safe)
 _browser_lock = threading.Lock()
@@ -70,19 +78,19 @@ def get_browser():
 
 
 def _classify_challenge(page) -> str:
-    """Classify the challenge type by inspecting the page source.
+    """Detect what kind of challenge the page is showing.
 
-    Returns 'hcaptcha', 'jspow', or 'unknown'.
+    Returns one of: 'hcaptcha', 'turnstile', 'jspow', 'unknown'.
     """
     try:
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        # Wait for async hCaptcha scripts to load
         time.sleep(5)
         html = page.content().lower()
-        # Check for hCaptcha (primary: scripts, iframes, divs)
+
+        # hCaptcha (visual puzzle — needs 3rd-party solver)
         if any(marker in html for marker in [
             "hcaptcha.com/1/api.js",
             "h-captcha",
@@ -90,12 +98,127 @@ def _classify_challenge(page) -> str:
             "hcaptcha",
         ]):
             return "hcaptcha"
+
+        # Cloudflare Turnstile (invisible / checkbox)
+        if any(marker in html for marker in [
+            "challenges.cloudflare.com",
+            "cf-turnstile",
+            "turnstile",
+            "cf_challenge_platform",
+            "turnstile-wrapper",
+        ]):
+            return "turnstile"
+
+        # JS proof-of-work (DDoS-Guard / Cloudflare)
         if "js-challenge" in html or "challenge-platform" in html:
             return "jspow"
+
         return "unknown"
     except Exception as e:
         log.debug("Challenge detection error: %s", e)
         return "unknown"
+
+
+# ── Turnstile click-based solving (out of the box) ───────────────────────
+
+
+def _turnstile_widget_box(page):
+    """Measure the Turnstile widget's bounding box for clicking."""
+    try:
+        # First try: Turnstile iframe
+        iframe = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+        if iframe:
+            box = iframe.bounding_box()
+            if box and box["width"] > _WIDGET_MIN_WIDTH:
+                return box
+
+        # Second try: wrapper via cf-turnstile-response input ancestors
+        input_el = page.query_selector('input[name="cf-turnstile-response"]')
+        if input_el:
+            for depth in (1, 2, 3, 4):
+                try:
+                    ancestor = input_el.evaluate(
+                        f"""el => {{
+                            let a = el;
+                            for (let i = 0; i < {depth}; i++) {{
+                                a = a.parentElement;
+                                if (!a) return null;
+                            }}
+                            const r = a.getBoundingClientRect();
+                            return r.width > {_WIDGET_MIN_WIDTH} &&
+                                   r.height > {_WIDGET_MIN_HEIGHT} &&
+                                   r.height < {_WIDGET_MAX_HEIGHT}
+                                   ? {{x: r.x, y: r.y, width: r.width, height: r.height}}
+                                   : null;
+                        }}"""
+                    )
+                    if ancestor:
+                        return ancestor
+                except Exception:
+                    continue
+
+        # Third try: common selectors
+        for sel in ("#turnstile-wrapper", ".cf-turnstile", "[data-cf-turnstile]"):
+            el = page.query_selector(sel)
+            if el:
+                box = el.bounding_box()
+                if box and box["width"] > _WIDGET_MIN_WIDTH:
+                    return box
+
+        return None
+    except Exception as e:
+        log.debug("Widget box detection error: %s", e)
+        return None
+
+
+def _turnstile_has_token(page) -> bool:
+    """Check whether the Turnstile hidden input has a token."""
+    try:
+        token = page.evaluate(
+            """() => {
+                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                return el ? el.value : '';
+            }"""
+        )
+        return bool(token and len(token) > 10)
+    except Exception:
+        return False
+
+
+def _solve_turnstile_click(page) -> bool:
+    """Click the Turnstile checkbox and wait for verification.
+
+    Works out of the box — Turnstile's checkbox is a passive fingerprint
+    check, not a visual puzzle. Returns True if the challenge cleared.
+    """
+    log.info("Solving Turnstile via click...")
+    deadline = time.monotonic() + _TURNSTILE_DEADLINE_SECONDS
+
+    while time.monotonic() < deadline:
+        if _turnstile_has_token(page):
+            log.info("Turnstile already verified (token present)")
+            return True
+
+        box = _turnstile_widget_box(page)
+        if box:
+            click_x = box["x"] + _TURNSTILE_CHECKBOX_X
+            click_y = box["y"] + box["height"] * 0.5
+            page.mouse.click(click_x, click_y)
+            log.debug("Clicked Turnstile at (%.0f, %.0f)", click_x, click_y)
+
+        for _ in range(int(_TURNSTILE_DEADLINE_SECONDS / _TURNSTILE_POLL_INTERVAL)):
+            if time.monotonic() > deadline:
+                break
+            if _turnstile_has_token(page):
+                log.info("Turnstile verified after click!")
+                return True
+            time.sleep(_TURNSTILE_POLL_INTERVAL)
+
+    log.warning("Turnstile did not verify within timeout")
+    return False
+
+
+# ── hCaptcha solving (requires 2Captcha) ─────────────────────────────────
 
 
 def _extract_sitekey(page) -> str | None:
@@ -172,23 +295,11 @@ def _solve_hcaptcha(sitekey: str, page_url: str) -> str | None:
     return None
 
 
-def _inject_token(page, token: str) -> bool:
-    """Inject an hCaptcha token into the DDoS-Guard page and trigger the callback."""
+def _inject_hcaptcha_token(page, token: str) -> bool:
+    """Inject an hCaptcha token into the DDoS-Guard page and trigger verification."""
     try:
-        # First, check the __ddg3 cookie value
-        ddg3 = page.evaluate("""() => {
-            const m = document.cookie.match(/__ddg3=([^;]+)/);
-            return m ? m[1] : null;
-        }""")
-        log.info("__ddg3 cookie: %s", ddg3[:20] if ddg3 else "None")
-
-        # Also check navigator.webdriver
-        webdriver = page.evaluate("() => navigator.webdriver")
-        log.info("navigator.webdriver: %s", webdriver)
-
         page.evaluate(
             f"""() => {{
-                // Set the response via hCaptcha's API
                 try {{
                     if (typeof hcaptcha !== 'undefined') {{
                         const widgets = document.querySelectorAll('[data-hcaptcha-widget-id]');
@@ -197,32 +308,29 @@ def _inject_token(page, token: str) -> bool:
                             hcaptcha.setResponse(wid, '{token}');
                         }}
                     }}
-                }} catch(e) {{ console.log('hcaptcha API error:', e); }}
+                }} catch(e) {{}}
 
-                // Also set the textarea as fallback
                 try {{
                     const input = document.querySelector('textarea[name="h-captcha-response"]');
                     if (input) {{
-                        const nativeSetter = Object.getOwnPropertyDescriptor(
+                        const setter = Object.getOwnPropertyDescriptor(
                             window.HTMLTextAreaElement.prototype, 'value'
                         ).set;
-                        nativeSetter.call(input, '{token}');
+                        setter.call(input, '{token}');
                         input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         input.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     }}
-                }} catch(e) {{ console.log('textarea error:', e); }}
+                }} catch(e) {{}}
 
-                // Call the DDoS-Guard's callback function
                 try {{
                     if (typeof window.callbackHCaptcha === 'function') {{
                         window.callbackHCaptcha();
                     }}
-                }} catch(e) {{ console.log('callback error:', e); }}
-
+                }} catch(e) {{}}
                 return true;
             }}"""
         )
-        log.info("hCaptcha token injected via callbackHCaptcha")
+        log.info("hCaptcha token injected")
         return True
     except Exception as e:
         log.error("Token injection failed: %s", e)
@@ -230,7 +338,7 @@ def _inject_token(page, token: str) -> bool:
 
 
 def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
-    """Navigate to a URL, clear any DDoS-Guard challenge, return the page.
+    """Navigate to a URL, clear any challenge, return the page content.
 
     Returns a FlareSolverr-compatible response dict.
     """
@@ -255,15 +363,11 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
         page = context.new_page()
 
         # Apply stealth patches before any navigation
-        page.add_init_script("""
-        () => {
-            // Override navigator.webdriver
+        page.add_init_script(
+            """() => {
             Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-                configurable: true,
+                get: () => undefined, configurable: true,
             });
-
-            // Override navigator.plugins to have realistic length
             Object.defineProperty(navigator, 'plugins', {
                 get: () => {
                     const arr = [1, 2, 3, 4, 5];
@@ -274,14 +378,10 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
                 },
                 configurable: true,
             });
-
-            // Override navigator.languages
             Object.defineProperty(navigator, 'languages', {
                 get: () => ['en-US', 'en'],
                 configurable: true,
             });
-
-            // Override chrome.runtime to fake it
             if (window.chrome) {
                 window.chrome.runtime = {
                     id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -291,26 +391,21 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
                     onMessage: { addListener: () => {} },
                 };
             }
-
-            // Remove webdriver from navigator properties
-            const originalQuery = window.navigator.__proto__.webdriver;
             Object.defineProperty(Navigator.prototype, 'webdriver', {
-                get: () => false,
-                configurable: true,
+                get: () => false, configurable: true,
             });
-
-            // Override permissions.query
             if (navigator.permissions && navigator.permissions.query) {
-                const originalQuery = navigator.permissions.query;
-                navigator.permissions.query = (params) => (
-                    params.name === 'notifications' ? Promise.resolve({ state: 'denied' }) : originalQuery(params)
-                );
+                const q = navigator.permissions.query;
+                navigator.permissions.query = (p) =>
+                    p.name === 'notifications'
+                        ? Promise.resolve({ state: 'denied' })
+                        : q(p);
             }
-        }
-        """)
+        }"""
+        )
+
         log.info("Navigating to %s", url)
         page.goto(url, wait_until="domcontentloaded", timeout=max_timeout_ms)
-
         title = page.title()
         log.info("Page title: %s", title)
 
@@ -318,96 +413,69 @@ def solve_challenge(url: str, max_timeout_ms: int = 120000) -> dict:
 
         if is_challenge:
             challenge_was_present = True
-            log.info("DDoS-Guard challenge detected, classifying...")
-
             challenge_type = _classify_challenge(page)
             log.info("Challenge type: %s", challenge_type)
 
-            if challenge_type == "hcaptcha":
+            if challenge_type == "turnstile":
+                solved = _solve_turnstile_click(page)
+
+            elif challenge_type == "hcaptcha":
                 if CAPTCHA_API_KEY:
                     log.info("Solving hCaptcha via 2Captcha...")
                     sitekey = _extract_sitekey(page)
                     if sitekey:
                         token = _solve_hcaptcha(sitekey, url)
                         if token:
-                            _inject_token(page, token)
-                            # Wait for the real page to load (not just title change)
+                            _inject_hcaptcha_token(page, token)
                             for _ in range(30):
                                 if time.monotonic() > deadline:
                                     break
                                 time.sleep(2)
                                 try:
-                                    current_url = page.url
-                                    current_title = page.title()
-                                    # Check if we're on the real site (not DDoS-Guard)
+                                    ct = page.title()
                                     if not any(
-                                        t.lower() in current_title.lower()
-                                        for t in CHALLENGE_TITLES
+                                        t.lower() in ct.lower() for t in CHALLENGE_TITLES
                                     ):
-                                        # Verify the page content is actually the real page
                                         try:
-                                            content_check = page.content()
-                                            if "hcaptcha" not in content_check.lower()[:500]:
+                                            cc = page.content()
+                                            if "hcaptcha" not in cc.lower()[:500]:
                                                 solved = True
-                                                log.info("Challenge cleared! Real page loaded: %s", current_title)
                                                 break
                                         except Exception:
                                             solved = True
                                             break
                                 except Exception:
-                                    # Page navigating - this is good, wait for it to settle
                                     time.sleep(1)
-                                    pass
-                            if solved:
-                                log.info("Challenge cleared after hCaptcha solve!")
-                            else:
-                                log.warning("hCaptcha token injected but challenge didn't clear")
                         else:
-                            log.warning("2Captcha failed — challenge unsolvable")
+                            log.warning("2Captcha failed")
                     else:
-                        log.warning("No sitekey found on hCaptcha page")
+                        log.warning("No sitekey found")
                 else:
                     log.warning("hCaptcha detected but CAPTCHA_API_KEY not set")
-                    log.info("Waiting for possible auto-solve...")
-                    while time.monotonic() < deadline:
-                        try:
-                            current_title = page.title()
-                        except Exception:
-                            solved = True
-                            break
-                        if not any(
-                            t.lower() in current_title.lower() for t in CHALLENGE_TITLES
-                        ):
-                            solved = True
-                            break
-                        time.sleep(1)
-            else:
-                # JS PoW or unknown — wait for it to clear
-                log.info("Waiting for JS PoW challenge to clear...")
+
+            elif challenge_type in ("jspow", "unknown"):
+                log.info("Waiting for JS PoW / interstitial to clear...")
                 while time.monotonic() < deadline:
                     try:
-                        current_title = page.title()
+                        ct = page.title()
                     except Exception:
-                        log.info("Challenge cleared! Page navigated to new content")
+                        log.info("Challenge cleared (navigation detected)")
                         solved = True
                         break
-                    if not any(
-                        t.lower() in current_title.lower() for t in CHALLENGE_TITLES
-                    ):
-                        log.info("Challenge cleared! Title: %s", current_title)
+                    if not any(t.lower() in ct.lower() for t in CHALLENGE_TITLES):
+                        log.info("Challenge cleared! Title: %s", ct)
                         solved = True
                         break
                     time.sleep(1)
         else:
             log.info("No challenge detected")
 
-        # Let the page settle
+        # Settle and read final content
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
 
-        # Read final page state — handle navigation destroying the old context
         try:
             page_content = page.content()
             final_title = page.title()
@@ -493,6 +561,6 @@ if __name__ == "__main__":
     if CAPTCHA_API_KEY:
         log.info("2Captcha integration ENABLED")
     else:
-        log.info("2Captcha DISABLED (CAPTCHA_API_KEY not set)")
+        log.info("2Captcha DISABLED")
     log.info("Gatecrasher starting — listening on :8191")
     app.run(host="0.0.0.0", port=8191, threaded=False)
